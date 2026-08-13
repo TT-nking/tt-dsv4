@@ -15,6 +15,15 @@ is **151.9 GB, about 24 GB over budget**. Weight streaming from host DRAM is the
 not an optimization we might add later — it is a load-bearing part of the design and
 has to be in the architecture from day one.
 
+Because streaming is load-bearing, the host link is on the critical path, and here the box
+has an awkward property: its motherboard has only one x16-capable slot, so the two p300
+cards get **~63 GB/s and ~8 GB/s** rather than matching links. Sharding experts uniformly —
+the obvious layout, and the one the existing demos imply — puts the slow card in the
+critical path and caps decode at ~18 tok/s. Confining the streamed working set to the fast
+card lifts the same ceiling to ~70 tok/s. **A ~4x swing that costs nothing but placement,
+and the difference between missing and clearing our performance floor.** Details and the
+one-command way to verify it are in §2.
+
 The good news is that the model's own design works strongly in our favour everywhere
 else. The KV cache at a full 1M-token context is only **3.9 GB**, which is the whole
 point of the CSA/HCA hybrid attention, and it means context length is essentially free
@@ -50,11 +59,52 @@ most affects the outcome does not need hardware and has not been taken yet.
 | DRAM bandwidth | 2048 GB/s aggregate (512 GB/s per chip) |
 | Compute | 2654 TFLOP/s BlockFP8 (all 4 chips) |
 | Chip interconnect | Warp400, 2x per card + inter-card ARP6 cable |
-| Host | Ryzen 7 9700X, 256 GB DDR5-5600 (~90 GB/s), PCIe Gen5 |
+| Host | Ryzen 7 9700X, 256 GB DDR5-5600 (~90 GB/s) |
+| Board | ASRock B850M-C, mATX |
+| Host link | card A Gen5 x16 (~63 GB/s), card B Gen4 x4 (~8 GB/s) — see below |
 | OS | Ubuntu 24.04.3 LTS |
 
 The two numbers that drive every decision: **2048 GB/s** on-device versus **~90 GB/s**
 from host memory. Anything we are forced to stream costs us a ~23x bandwidth penalty.
+
+### The two cards do not have equal host bandwidth
+
+This is the single most consequential hardware detail on the box, and it is easy to miss.
+The B850M-C has exactly one x16-capable slot. From the board manual: `PCIE1` is Gen5 x16
+with Ryzen 9000, `PCIE4` is an x16-*length* slot wired **x4** Gen4, and `PCIE2`/`PCIE3`
+run at x1. AM5 Granite Ridge does not have the lanes to do better. So whichever slots the
+two p300 cards occupy, one gets ~63 GB/s to the host and the other gets at most ~8 GB/s.
+
+That asymmetry decides whether streaming is viable, because streaming bandwidth is set by
+the *slowest* path carrying traffic, not the sum of the links:
+
+| Expert placement | Effective host->device | Decode ceiling @ batch 1 |
+|---|---|---|
+| Sharded evenly over all 4 chips | 16 GB/s (2x the x4 link) | ~18 tok/s |
+| Streamed pool behind the x16 card only | 63 GB/s | ~70 tok/s |
+
+A ~4x throughput swing from placement alone, and the difference between missing the
+30 tok/s floor of §9 and clearing the 60 tok/s target. The uniform sharding that every
+tutorial reaches for is the one layout that cannot hit the floor.
+
+**Design consequence.** Expert residency has to be deliberately asymmetric: the x4 card
+holds only *resident* experts and never streams, while the streaming pool lives entirely
+in the x16 card's 64 GB. This costs us half the device memory as streaming backing store,
+so the resident fraction on the fast card is lower than the 75% whole-box figure, and it
+couples expert placement to the parallelism strategy in §5 — experts cannot be assigned to
+chips by index alone. It also means the mHC/router all-to-all is asymmetric, since the two
+cards play different roles.
+
+**Verify before designing around it.** The above is inferred from the board model, not
+measured. On the box:
+
+```bash
+lspci -d 1e52: -vv | grep -E 'LnkSta|LnkCap'   # Tenstorrent vendor ID
+```
+
+Confirm the negotiated width per card. If Tenstorrent ships a variant board, a riser, or
+a PCIe switch, these numbers change and the placement conclusion may relax — which would
+be good news. Either way it is a five-second check that gates a large design decision.
 
 ## 3. What is actually new in V4
 
@@ -145,18 +195,20 @@ this port rather than something to ration.
 ### What streaming costs
 
 With ~75% of experts resident and the remainder streamed over PCIe, against the same
-model with everything resident:
+model with everything resident. Both streaming placements from §2 are shown, since the
+gap between them dwarfs every other effect in this table:
 
-| batch | streaming | fully resident |
-|---|---|---|
-| 1 | 100 tok/s | 188 tok/s |
-| 8 | 109 tok/s | 482 tok/s |
-| 64 | 191 tok/s | 1020 tok/s |
+| batch | streamed evenly (16 GB/s) | streamed via x16 card (63 GB/s) | fully resident |
+|---|---|---|---|
+| 1 | 18 tok/s | 70 tok/s | 188 tok/s |
+| 8 | 19 tok/s | 76 tok/s | 482 tok/s |
+| 64 | 34 tok/s | 135 tok/s | 1020 tok/s |
 
 These are pure bandwidth ceilings with no compute or launch overhead, so treat them as
-upper bounds on the *ratio*, not as forecasts. The shape is what matters: streaming
-costs roughly 2x at batch 1 and **5x at batch 64**, because larger batches touch nearly
-every expert and destroy any residency advantage.
+upper bounds on the *ratio*, not as forecasts. Two things matter in the shape. First,
+placement is worth ~4x and is entirely ours to choose. Second, even in the good column
+streaming costs ~2.7x at batch 1 and **7.6x at batch 64**, because larger batches touch
+nearly every expert and destroy any residency advantage.
 
 That shape sets the product decision. A $9,999 desk-side workstation is an interactive,
 low-batch machine. We should optimize hard for batch 1–8 and treat high-throughput
@@ -172,10 +224,14 @@ At batch 1:
 
 | policy | balanced, no reuse | balanced + reuse 0.6 | mild skew + reuse | strong skew |
 |---|---|---|---|---|
-| capacity floor | 75.4% → 101 tok/s | 75.4% → 101 tok/s | 75.4% → 101 tok/s | 75.4% → 101 tok/s |
-| plain LRU | 74.8% → 98 tok/s | **90.1% → 182 tok/s** | 84.7% → 162 tok/s | 92.8% → 183 tok/s |
-| pinned hot set + LRU | 74.9% → 99 tok/s | 90.1% → 182 tok/s | 85.1% → 167 tok/s | 93.1% → 184 tok/s |
-| static popularity | 75.3% → 100 tok/s | 75.9% → 103 tok/s | 79.5% → 121 tok/s | 93.5% → 184 tok/s |
+| capacity floor | 75.4% → 71 tok/s | 75.4% → 71 tok/s | 75.4% → 71 tok/s | 75.4% → 71 tok/s |
+| plain LRU | 74.8% → 69 tok/s | **90.1% → 177 tok/s** | 84.7% → 114 tok/s | 92.8% → 183 tok/s |
+| pinned hot set + LRU | 74.9% → 69 tok/s | 90.1% → 175 tok/s | 85.1% → 117 tok/s | 93.1% → 184 tok/s |
+| static popularity | 75.3% → 71 tok/s | 75.9% → 72 tok/s | 79.5% → 85 tok/s | 93.5% → 184 tok/s |
+
+These assume the streamed pool sits behind the x16 card (§2). Under even sharding every
+cell in the table falls below the 30 tok/s floor regardless of hit rate, which is why
+placement is settled first and cache policy second.
 
 Four conclusions worth acting on:
 
@@ -184,7 +240,7 @@ Four conclusions worth acting on:
    at the on-device bound and further cache work buys nothing. A much easier goal than
    "make it all fit".
 2. **Temporal reuse, not popularity skew, is the variable that decides this.** Holding
-   routing perfectly balanced and moving reuse from 0 to 0.6 moves decode from 98 to 182
+   routing perfectly balanced and moving reuse from 0 to 0.6 moves decode from 69 to 177
    tok/s — nearly the entire available range. This matters because V4-Flash uses
    `score_correction_bias` (aux-loss-free balancing), whose explicit purpose is to
    flatten expert popularity. We should design assuming **skew ≈ 0** and treat any skew
@@ -205,7 +261,7 @@ Four conclusions worth acting on:
 
 The one thing this cannot tell us is where the real model sits on the reuse axis. That
 is now **the single highest-value measurement in the whole project**, since it alone
-spans a 1.9x range in decode throughput. It does not need QuietBox 2 and it does not
+spans a 2.6x range in decode throughput. It does not need QuietBox 2 and it does not
 need a working TT model — only the router weights and a forward pass, which means it can
 be done on CPU today (see §9). `expert_cache_sim.py --trace` consumes the result
 directly.
@@ -227,6 +283,27 @@ Per-chip budget check: 32 GB minus ~1.7 GB sharded dense minus 3.9 GB KV leaves
 ~26.4 GB for experts, against 36.3 GB needed. Confirms the ~73–75% residency figure
 independently.
 
+### EP=4 by expert index is the layout §2 rules out
+
+The clean "64 consecutive experts per chip" split spreads the streamed remainder evenly
+over both cards, which is exactly the 16 GB/s case. The fix is to keep EP=4 for *compute*
+but make **residency** asymmetric: the two chips on the x4 card hold a fully resident
+slice and never stream, while the streamed working set is confined to the x16 card's two
+chips.
+
+Sizing it: of the 36.3 GB of experts per-chip-equivalent, ~26.4 GB fits per chip. Give the
+x4 card's two chips their full resident slice and let the x16 card absorb the deficit,
+which lands roughly 2/3 of the streamed traffic on ~1/2 the memory. That trade is
+favourable only because the fast link is ~8x the slow one.
+
+Two costs to design around. Dispatch/combine becomes asymmetric, so the all-to-all is no
+longer a uniform collective and load balancing has to account for the fact that the x16
+card's experts have variable latency. And expert-to-chip assignment becomes a placement
+*decision* rather than `expert_id % 4` — which means the routing statistics from §4 feed
+into placement, not just cache policy. Worth confirming the `lspci` widths (§2) before
+building any of this, since a switched or bifurcated topology would let us keep the simple
+layout.
+
 ## 6. Op inventory: reuse vs build
 
 tt-metal is much further along on V4 than expected. It already vendors the V4 HF
@@ -244,10 +321,29 @@ were *written for this model* and are tested at its exact geometry.
 | `ttnn.transformer.sparse_sdpa` | Gathered top-k attention over a compressed cache — the shape of the CSA read. |
 | `scaled_dot_product_attention` (+ decode) | Carries `attention_sink`. Paged KV via `paged_fill_cache` / `paged_update_cache`. |
 
-`models/demos/deepseek_v3_d_p` (disaggregated prefill) is the primary reuse surface: it
-is Blackhole-first and its tests already run on 4-chip QuietBox meshes. What does *not*
-exist is a `DeepSeekV4FlashAdapter` or a V4 `TtPrefillTransformer` — the config and the
-ops are there, the assembled model is not.
+`models/demos/deepseek_v3_d_p` (disaggregated prefill) is the primary reuse surface and is
+Blackhole-first. What does *not* exist is a `DeepSeekV4FlashAdapter` or a V4
+`TtPrefillTransformer` — the config and the ops are there, the assembled model is not.
+
+**QuietBox 2 is below the smallest mesh this stack is tested on.** Its CI-gated coverage
+is `(4, 2)` on a Blackhole LoudBox and `(8, 4)` on a Blackhole Galaxy
+(`tests/conftest.py:53`) — 8 and 32 chips. QuietBox 2 is `ClusterType::P300_X2`, 2 P300
+cards and **4** chips, so `(2, 2)` or `(1, 4)`. Compounding it,
+`tests/cache/test_mla_cache.py:41` notes "Blackhole forms whole-box meshes only", so we
+cannot carve a tested 8-chip shape out of a 4-chip box — the mesh is the whole box.
+
+That same comment describes a "4-device QuietBox" as a *Wormhole* shape, i.e. the
+original QuietBox, not QuietBox 2. An earlier version of this section cited it as
+evidence that these tests already run on QuietBox 2 hardware. They do not, and the two
+boxes are different architectures: original QuietBox is Wormhole (`T3K`-class), QuietBox 2
+is Blackhole (`P300_X2`). Nothing in the disaggregated-prefill test matrix targets 4
+Blackhole chips.
+
+Practical consequence: we will be the first to run this stack at this mesh size, so
+expect to hit untested paths in dispatch/combine and fabric setup rather than just
+missing kernels. Worth budgeting time for, and worth running the existing
+`deepseek_v3_d_p` tests at `(2, 2)` on the box early to find out what breaks before any
+V4 work depends on it.
 
 ### Must be built (in rough order of risk)
 
@@ -398,15 +494,18 @@ Decode figures below are batch 1. Roofline is the pure-bandwidth ceiling from
 collectives and imperfect overlap are counted, and that discount is the main reason these
 targets sit well below the roofline.
 
+All three tiers assume the §2 placement fix. Without it the roofline itself is 18 tok/s
+and the floor is unreachable, so placement is a precondition rather than an optimization.
+
 | tier | batch-1 decode | rationale |
 |---|---|---|
-| floor | 30 tok/s | comfortably faster than reading speed; the model is *usable* |
-| target | 60 tok/s | ~60% realization against a 100 tok/s capacity-floor roofline |
-| stretch | 120 tok/s | requires hit rate ≥ 86%, i.e. streaming fully hidden |
+| floor | 30 tok/s | comfortably faster than reading speed; the model is *usable*. ~42% realization against the 71 tok/s capacity-floor roofline, so reachable with no cache cleverness at all |
+| target | 60 tok/s | needs either ~85% realization of the capacity floor, or any modest amount of temporal reuse to lift the roofline |
+| stretch | 120 tok/s | needs hit rate ≥ 86%, i.e. streaming fully hidden behind compute |
 
-The stretch tier is gated entirely on the reuse measurement, not on kernel quality. That
-is worth restating: **the difference between the target and stretch tiers is a property
-of the model we have not measured yet, not work we have not done.**
+The upper tiers are gated mostly on the reuse measurement, not on kernel quality. That is
+worth restating: **much of the difference between the target and stretch tiers is a
+property of the model we have not measured yet, not work we have not done.**
 
 Two supporting targets: time-to-first-token should stay interactive at long context
 (prefill is compute-bound and parallelizes well, so this should be the easy one), and

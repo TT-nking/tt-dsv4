@@ -36,8 +36,12 @@ class Hardware:
     host_dram_gb: int = 256
     # DDR5-5600 dual channel = 2 * 5600 MT/s * 8 B = 89.6 GB/s theoretical.
     host_dram_bw_gbps: float = 89.6
-    # PCIe Gen5 x16 ~= 63 GB/s usable per card, 2 cards.
-    pcie_gbps_per_card: float = 63.0
+    # Host link per card, and the two are *not* equal. QuietBox 2 ships an ASRock
+    # B850M-C, which has exactly one x16-capable slot: PCIE1 is Gen5 x16 (~63 GB/s)
+    # while PCIE4 is an x16-length slot wired x4 Gen4 (~8 GB/s). PCIE2/PCIE3 are x1.
+    # So the two p300 cards cannot both have a fast host link on this board, whichever
+    # slots they sit in. Confirm on the box with `lspci -vv | grep -i lnksta`.
+    pcie_gbps_per_card: tuple[float, ...] = (63.0, 8.0)
     cards: int = 2
 
     @property
@@ -54,8 +58,22 @@ class Hardware:
 
     @property
     def host_to_device_gbps(self) -> float:
-        """Weight streaming is capped by whichever of host DRAM / PCIe is slower."""
-        return min(self.host_dram_bw_gbps, self.pcie_gbps_per_card * self.cards)
+        """Streaming bandwidth with the streamed pool spread evenly across both cards.
+
+        The obvious layout — shard experts uniformly over all 4 chips — makes each card
+        carry half the streamed bytes. The x4 card then sets the pace for everyone, so
+        the usable aggregate collapses to twice the *slowest* link, not the sum.
+        """
+        return min(self.host_dram_bw_gbps, min(self.pcie_gbps_per_card) * self.cards)
+
+    @property
+    def host_to_device_gbps_fast_card(self) -> float:
+        """Streaming bandwidth if every streamed expert sits behind the x16 link.
+
+        Costs flexibility: only the fast card's GDDR6 can back the streaming pool, so
+        the resident set has to be laid out asymmetrically to match.
+        """
+        return min(self.host_dram_bw_gbps, max(self.pcie_gbps_per_card))
 
 
 QB2 = Hardware()
@@ -342,7 +360,8 @@ def demote_fraction_to_fit(c: Config, tensors: list[Tensor], scheme: dict[str, s
 
 
 def decode_step(c: Config, tensors: list[Tensor], scheme: dict[str, str], batch: int,
-                resident_expert_frac: float, hw: Hardware = QB2) -> dict[str, float]:
+                resident_expert_frac: float, hw: Hardware = QB2,
+                h2d_gbps: float | None = None) -> dict[str, float]:
     """Bytes crossing each bus for one decode step, and the resulting time.
 
     Dense weights are always device-resident and read once per step regardless of
@@ -368,7 +387,7 @@ def decode_step(c: Config, tensors: list[Tensor], scheme: dict[str, str], batch:
     on_chip = dense + touched + streamed
 
     t_chip_ms = on_chip / (hw.dram_bw_total_gbps * 1e9) * 1e3
-    t_stream_ms = streamed / (hw.host_to_device_gbps * 1e9) * 1e3
+    t_stream_ms = streamed / ((h2d_gbps or hw.host_to_device_gbps) * 1e9) * 1e3
     step_ms = max(t_chip_ms, t_stream_ms)  # assume perfect prefetch overlap
     return {"distinct": expected_distinct, "touched": touched, "on_chip": on_chip,
             "streamed": streamed, "t_chip_ms": t_chip_ms, "t_stream_ms": t_stream_ms,
@@ -428,8 +447,13 @@ def main() -> None:
             verdict += "   [no ttnn DataType: " + ",".join(sorted(blocked)) + "]"
         print(f"{name:42s} {fmt_gb(exp_b)} {fmt_gb(tot_b - exp_b)} {fmt_gb(tot_b)}  {verdict}")
 
-    print(f"\nQB2 device DRAM: {QB2.dram_total_gb:.0f} GB   host DRAM: {QB2.host_dram_gb} GB"
-          f"   host->device: {QB2.host_to_device_gbps:.1f} GB/s")
+    print(f"\nQB2 device DRAM: {QB2.dram_total_gb:.0f} GB   host DRAM: {QB2.host_dram_gb} GB")
+    links = "  ".join(f"{g:.0f}" for g in QB2.pcie_gbps_per_card)
+    print(f"host links per card: {links} GB/s  (one x16 slot on the board, so the "
+          f"second card is x4)")
+    print(f"host->device: {QB2.host_to_device_gbps:.1f} GB/s if streamed evenly across "
+          f"cards, {QB2.host_to_device_gbps_fast_card:.1f} GB/s if streamed only via the "
+          f"x16 card")
 
     print("\n--- KV cache (single sequence) ---")
     print(f"{'context':>10s} {'sliding':>10s} {'csa pool':>10s} {'csa idx':>10s} {'hca pool':>10s} {'total':>11s}")
@@ -458,12 +482,15 @@ def main() -> None:
     room = weight_budget - dense_bytes(tensors, scheme)
     rf = min(1.0, room / expert_bytes(tensors, scheme))
     print(f"expert residency {rf * 100:.1f}%  ->  {(1 - rf) * 100:.1f}% of expert reads stream over PCIe")
-    print(f"{'batch':>6s} {'distinct E':>11s} {'read/step':>11s} {'on-chip ms':>11s} "
-          f"{'stream ms':>11s} {'step ms':>9s} {'tok/s':>9s}")
-    for B in (1, 2, 4, 8, 16, 32, 64):
-        d = decode_step(c, tensors, scheme, B, rf)
-        print(f"{B:>6d} {d['distinct']:>11.1f} {d['touched'] / GB:>8.2f} GB "
-              f"{d['t_chip_ms']:>10.2f} {d['t_stream_ms']:>10.2f} {d['step_ms']:>8.2f} {d['tok_s']:>9.1f}")
+    for label, h2d in (("streamed evenly across both cards", QB2.host_to_device_gbps),
+                       ("streamed only via the x16 card", QB2.host_to_device_gbps_fast_card)):
+        print(f"\n  {label} ({h2d:.0f} GB/s):")
+        print(f"{'batch':>6s} {'distinct E':>11s} {'read/step':>11s} {'on-chip ms':>11s} "
+              f"{'stream ms':>11s} {'step ms':>9s} {'tok/s':>9s}")
+        for B in (1, 2, 4, 8, 16, 32, 64):
+            d = decode_step(c, tensors, scheme, B, rf, h2d_gbps=h2d)
+            print(f"{B:>6d} {d['distinct']:>11.1f} {d['touched'] / GB:>8.2f} GB "
+                  f"{d['t_chip_ms']:>10.2f} {d['t_stream_ms']:>10.2f} {d['step_ms']:>8.2f} {d['tok_s']:>9.1f}")
 
     print("\n--- same, if everything is made to fit on device (no streaming) ---")
     print(f"{'batch':>6s} {'read/step':>11s} {'step ms':>9s} {'tok/s':>9s}")

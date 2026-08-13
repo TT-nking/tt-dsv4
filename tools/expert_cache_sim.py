@@ -149,7 +149,11 @@ def simulate(fit, ev, layers: int, experts: int, capacity: int, policy: str,
 
 
 def decode_tok_s(c, tensors, scheme, batch: int, hit_rate: float, hw=B.QB2) -> float:
-    d = B.decode_step(c, tensors, scheme, batch, hit_rate, hw)
+    # Assumes the streamed pool sits behind the x16 card (see PLAN.md section 2). The
+    # even-sharding alternative caps at ~16 GB/s and cannot reach the floor at any hit
+    # rate, so scoring cache policies against it would only measure the bad layout.
+    d = B.decode_step(c, tensors, scheme, batch, hit_rate, hw,
+                      h2d_gbps=hw.host_to_device_gbps_fast_card)
     return d["tok_s"]
 
 
