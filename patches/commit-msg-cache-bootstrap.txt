@@ -1,0 +1,27 @@
+Fix DeepSeek-V4 reference so it can bootstrap a KV cache
+
+The vendored DeepSeek-V4 reference cannot run autoregressive decode. Three
+issues compound:
+
+1. DeepseekV4HCACache/DeepseekV4CSACache declare `layer_type` instead of
+   `_layer_type`. CacheLayerMixin.__init_subclass__ auto-registers into
+   DYNAMIC_LAYER_TYPE_MAPPING keyed on `_layer_type`, so neither class ever
+   registers and DynamicCache(config=...) raises
+   KeyError: 'compressed_sparse_attention'.
+
+2. DeepseekV4HCACache.__init__ passes `config` positionally to
+   DynamicSlidingWindowLayer.__init__(self, sliding_window: int, **kwargs),
+   binding sliding_window to a config object. Both cache classes also dropped
+   the **kwargs that absorbs the sliding_window kwarg DynamicCache supplies.
+
+3. DeepseekV4Model.forward binds `return_cache` before the cache is created,
+   so a first forward with use_cache=True and no cache builds a DynamicCache,
+   uses it, and then returns None.
+
+Issue 3 fails silently: the model returns no cache, so a decode loop re-runs
+prefill every step and produces wrong output rather than raising.
+
+Verified against transformers' own deepseek_v4 implementation: with identical
+weights the patched reference is bit-exact with transformers.models.deepseek_v4
+(max abs error 0.0 across prefill and eight incremental decode steps), it
+bootstraps the expected cache layout, and generate() works.

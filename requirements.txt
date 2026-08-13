@@ -1,0 +1,6 @@
+# Analysis and reference-model tooling. Pure host-side; no Tenstorrent runtime here.
+# tt-metal / ttnn is installed separately on the target machine (Linux + TT hardware)
+# per https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md
+torch>=2.13
+transformers>=5.8
+numpy>=2.0
